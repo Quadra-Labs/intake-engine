@@ -6,9 +6,11 @@
  * the validator engine before payment is released.
  */
 import express from 'express';
+import { createServer } from 'node:http';
 
 import { loadIntakeConfig, createDataLayer, createGateway } from './config.js';
 import { AuthManager, authMiddleware, type AuthedRequest } from './auth.js';
+import { createNotifier } from './notify.js';
 import { IntakeEngine } from './engine.js';
 
 async function main(): Promise<void> {
@@ -16,8 +18,6 @@ async function main(): Promise<void> {
     const dl = createDataLayer();
     const gateway = createGateway(config);
     const auth = new AuthManager(dl, config.authWindowMs);
-    const engine = new IntakeEngine(dl, gateway, config);
-    engine.start();
 
     const app = express();
     // Capture the raw body so signatures verify against the exact bytes sent.
@@ -29,6 +29,14 @@ async function main(): Promise<void> {
         }),
     );
 
+    // Socket.IO shares this HTTP server and pushes job-paid notices to agents,
+    // authenticated with the same agent-signature scheme as the REST API.
+    const httpServer = createServer(app);
+    const notifier = createNotifier(httpServer, auth);
+
+    const engine = new IntakeEngine(dl, gateway, config, notifier);
+    engine.start();
+
     const requireAgent = authMiddleware(auth);
 
     // Agent opens a job (authenticated). Returns the session the user pays.
@@ -39,6 +47,7 @@ async function main(): Promise<void> {
                 template_id: body.template_id,
                 lifetime: body.lifetime,
                 cost: Number(body.cost),
+                asset: body.asset,
             })
             .then((session) => res.json(session))
             .catch((err) =>
@@ -75,8 +84,8 @@ async function main(): Promise<void> {
             );
     });
 
-    app.listen(config.port, () => {
-        console.log(`[intake] listening on http://localhost:${config.port}`);
+    httpServer.listen(config.port, () => {
+        console.log(`[intake] listening on http://localhost:${config.port} (HTTP + Socket.IO)`);
     });
 }
 

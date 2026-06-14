@@ -5,14 +5,17 @@
  */
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
 
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { Redis } from 'ioredis';
+import { io as ioClient } from 'socket.io-client';
 import type { DataLayer, GatewayClient } from 'quadra-data';
 
 import { AuthManager } from '../src/auth.js';
 import { IntakeEngine, parseLifetimeMs } from '../src/engine.js';
 import { Store } from '../src/store.js';
+import { createNotifier, SOCKET_AUTH_MESSAGE, type JobPaidNotice } from '../src/notify.js';
 import type { IntakeConfig } from '../src/config.js';
 
 async function testAuth(): Promise<void> {
@@ -75,9 +78,13 @@ async function testStore(): Promise<void> {
             category: 'finance',
             description: '',
             output: {},
-            evaluator_id: 'btc-price-guess',
+            evaluator_id: 'price-range-guess',
+            start_data_template: { start_price: 'number' },
+            minimum_lifetime: 60_000,
+            allowed_assets: ['BTC'],
         },
         lifetime: '5m',
+        asset: 'BTC',
         cost: 1000,
         created_at: Date.now(),
     });
@@ -94,6 +101,7 @@ async function testStore(): Promise<void> {
         paid_at_ms: past,
         deadline_ms: past,
         releasable: true,
+        asset: 'BTC',
     });
     assert.ok((await store.dueDeadlines(Date.now())).includes(jid), 'due deadline listed');
     assert.equal((await store.getActive(jid))?.escrow_id, '0xe', 'active round-trips');
@@ -174,6 +182,7 @@ async function testDeliver(): Promise<void> {
         deadline_ms: Date.now() + 60_000,
         releasable: true,
         lifetime: '5m',
+        asset: 'BTC',
     });
 
     const unknown = await engine.deliver('job_never_existed', '0xa');
@@ -196,11 +205,88 @@ async function testDeliver(): Promise<void> {
     console.log('  deliver: OK');
 }
 
+/** Socket.IO notifications: a signed, registered agent receives a job_paid pushed
+ * to its room; an unregistered agent is rejected at the handshake. No chain/Redis. */
+async function testSocket(): Promise<void> {
+    const kp = new Ed25519Keypair();
+    const addr = kp.toSuiAddress();
+    const dl = {
+        agents: { get: async (w: string) => (w === addr ? { wallet: w } : undefined) },
+    } as unknown as DataLayer;
+    const auth = new AuthManager(dl, 60_000);
+
+    const httpServer = createServer();
+    const notifier = createNotifier(httpServer, auth);
+    await new Promise<void>((resolve) => httpServer.listen(0, resolve));
+    const url = `http://localhost:${(httpServer.address() as AddressInfo).port}`;
+
+    const sign = async (keypair: Ed25519Keypair): Promise<{ ts: number; sig: string }> => {
+        const ts = Date.now();
+        const { signature } = await keypair.signPersonalMessage(
+            new TextEncoder().encode(`${ts}.${SOCKET_AUTH_MESSAGE}`),
+        );
+        return { ts, sig: signature };
+    };
+
+    // Registered agent connects, then receives the job_paid pushed to its room.
+    const notice: JobPaidNotice = {
+        session_id: 's1',
+        job_id: 'j1',
+        escrow_id: '0xe',
+        cost: 1000,
+        paid_at_ms: 1,
+        deadline_ms: 2,
+    };
+    const client = ioClient(url, {
+        auth: await sign(kp),
+        transports: ['websocket'],
+        reconnection: false,
+    });
+    const got = await new Promise<unknown>((resolve) => {
+        const timer = setTimeout(() => resolve('timeout'), 5000);
+        client.on('ready', () => notifier.jobPaid(addr, notice));
+        client.on('job_paid', (j) => {
+            clearTimeout(timer);
+            resolve(j);
+        });
+        client.on('connect_error', (e) => {
+            clearTimeout(timer);
+            resolve(`error:${e.message}`);
+        });
+    });
+    assert.deepEqual(got, notice, 'registered agent receives its job_paid');
+    client.disconnect();
+
+    // An unregistered agent is rejected at the handshake.
+    const stranger = ioClient(url, {
+        auth: await sign(new Ed25519Keypair()),
+        transports: ['websocket'],
+        reconnection: false,
+    });
+    const denied = await new Promise<string>((resolve) => {
+        const timer = setTimeout(() => resolve('timeout'), 5000);
+        stranger.on('connect', () => {
+            clearTimeout(timer);
+            resolve('connected');
+        });
+        stranger.on('connect_error', (e) => {
+            clearTimeout(timer);
+            resolve(e.message);
+        });
+    });
+    assert.match(denied, /not registered/, 'unregistered agent is rejected');
+    stranger.disconnect();
+
+    await notifier.close();
+    console.log('  socket: OK');
+}
+
 async function main(): Promise<void> {
     console.log('[intake] e2e checks');
     await testAuth();
     await testStore();
     await testDeliver();
+    await testSocket();
     console.log('[intake] all checks passed');
 }
 

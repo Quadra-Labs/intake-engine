@@ -7,6 +7,7 @@ import type { IntakeConfig } from './config.js';
 import { Store, type ActiveJob } from './store.js';
 import { Payments } from './payments.js';
 import { JobPaidWatcher, type JobPaidEvent } from './events.js';
+import type { AgentNotifier } from './notify.js';
 
 /** Parse a lifetime like "5m" / "30s" / "2h" / "1d" into milliseconds. */
 export function parseLifetimeMs(lifetime: string): number {
@@ -22,6 +23,7 @@ export interface JobSubmission {
     template_id: string;
     lifetime: string;
     cost: number;
+    asset: string;
 }
 
 /** The session handed back to the agent (relayed to the user, who pays it). */
@@ -42,11 +44,18 @@ export class IntakeEngine {
     #watcher: JobPaidWatcher;
     #sui: SuiJsonRpcClient;
     #timer: ReturnType<typeof setInterval> | undefined;
+    #notifier: AgentNotifier | undefined;
 
-    constructor(dl: DataLayer, gateway: GatewayClient, config: IntakeConfig) {
+    constructor(
+        dl: DataLayer,
+        gateway: GatewayClient,
+        config: IntakeConfig,
+        notifier?: AgentNotifier,
+    ) {
         this.#dl = dl;
         this.#gateway = gateway;
         this.#config = config;
+        this.#notifier = notifier;
         this.#sui = new SuiJsonRpcClient({
             url: getJsonRpcFullnodeUrl(dl.config.network),
             network: dl.config.network,
@@ -88,6 +97,12 @@ export class IntakeEngine {
         if (!template) throw new Error(`unknown template ${input.template_id}`);
         if (!input.lifetime) throw new Error('lifetime is required');
         if (!(input.cost > 0)) throw new Error('cost must be > 0');
+        if (!template.allowed_assets.includes(input.asset)) {
+            throw new Error(`asset ${input.asset} not allowed by template ${template.id}`);
+        }
+        if (parseLifetimeMs(input.lifetime) < template.minimum_lifetime) {
+            throw new Error(`lifetime below the template minimum (${template.minimum_lifetime}ms)`);
+        }
 
         const session: Session = {
             session_id: `sess_${randomUUID()}`,
@@ -99,6 +114,7 @@ export class IntakeEngine {
             ...session,
             template,
             lifetime: input.lifetime,
+            asset: input.asset,
             created_at: Date.now(),
         });
         return session;
@@ -118,11 +134,13 @@ export class IntakeEngine {
         if (!job || job.agent_wallet !== agentWallet) {
             return { released: false, reason: 'unknown job' };
         }
-        if (!job.releasable || !job.lifetime) {
+        if (!job.releasable || !job.lifetime || !job.asset) {
             return { released: false, reason: 'job is not releasable' };
         }
 
-        const verdict = await this.#askValidator(jobId);
+        // The validator decrypts + has the eval engine check the output, and
+        // returns the start data (price at delivery) for us to record.
+        const verdict = await this.#askValidator(jobId, job.asset);
         if (!verdict.valid) {
             return { released: false, reason: verdict.reason ?? 'invalid result' };
         }
@@ -142,9 +160,13 @@ export class IntakeEngine {
             await this.#store.unlockSettle(jobId);
         }
 
-        // Validated: register the job for scoring at its lifetime end.
+        // Validated: register the job for scoring at lifetime end, carrying the
+        // asset + start data so the scheduler can score against the delivery price.
         try {
-            await this.#gateway.scheduleJob(jobId, job.paid_at_ms + parseLifetimeMs(job.lifetime));
+            await this.#gateway.scheduleJob(jobId, job.paid_at_ms + parseLifetimeMs(job.lifetime), {
+                asset: job.asset,
+                data: verdict.start_data ?? {},
+            });
         } catch (error) {
             console.error(
                 `[intake] scheduling ${jobId} failed:`,
@@ -154,18 +176,26 @@ export class IntakeEngine {
         return { released: true };
     }
 
-    /** Ask the validator engine (under the scheduler) whether the result is valid. */
-    async #askValidator(jobId: string): Promise<{ valid: boolean; reason?: string }> {
+    /** Ask the validator engine (under the scheduler) whether the result is valid,
+     * and for the start data captured at delivery. */
+    async #askValidator(
+        jobId: string,
+        asset: string,
+    ): Promise<{ valid: boolean; reason?: string; start_data?: Record<string, unknown> }> {
         const res = await fetch(`${this.#config.validatorUrl}/validate`, {
             method: 'POST',
             headers: {
                 'content-type': 'application/json',
                 'x-quadra-internal': this.#config.internalToken,
             },
-            body: JSON.stringify({ job_id: jobId }),
+            body: JSON.stringify({ job_id: jobId, asset }),
         });
         if (!res.ok) throw new Error(`validator responded ${res.status}`);
-        return (await res.json()) as { valid: boolean; reason?: string };
+        return (await res.json()) as {
+            valid: boolean;
+            reason?: string;
+            start_data?: Record<string, unknown>;
+        };
     }
 
     async status(): Promise<{ pending: number; active: number }> {
@@ -189,15 +219,24 @@ export class IntakeEngine {
             paid_at_ms: event.paid_at_ms,
             deadline_ms,
             releasable,
-            // Kept so `deliver` can schedule the scoring window once validated.
-            ...(pending ? { lifetime: pending.lifetime } : {}),
+            // Kept so `deliver` can validate + schedule the scoring window.
+            ...(pending ? { lifetime: pending.lifetime, asset: pending.asset } : {}),
         };
         await this.#store.putActive(job);
-        if (releasable)
+        if (releasable) {
+            // Tell the agent its job is paid so it can start working.
+            this.#notifier?.jobPaid(event.agent_wallet, {
+                session_id: event.session_id,
+                job_id: event.job_id,
+                escrow_id: event.escrow_id,
+                cost: event.cost,
+                paid_at_ms: event.paid_at_ms,
+                deadline_ms,
+            });
             console.log(
                 `[intake] job ${job.job_id} paid; active until ${new Date(deadline_ms).toISOString()}`,
             );
-        else if (pending)
+        } else if (pending)
             console.warn(
                 `[intake] job ${job.job_id} underpaid (${event.cost} < ${pending.cost}); will refund`,
             );

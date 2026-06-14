@@ -50,6 +50,50 @@ the on-chain `agent::AgentRegistry`. Unregistered or stale → `401`.
   outage is a 502 (retry later).
 - `GET /health`, `GET /status` — pending/active counts.
 
+## Agent notifications (Socket.IO)
+
+The engine watches `JobPaid` on-chain. When a job an agent proposed is paid (a
+known session, paid at or above its agreed cost), the engine pushes a `job_paid`
+event to **that agent only**, over a Socket.IO connection on the same host/port as
+the HTTP API (default `5000`). This is how an agent learns to start working — it
+does not poll the chain.
+
+**Connect + auth.** The socket uses the same Sui-signature scheme as the REST API,
+over the fixed message `quadra-intake/socket`. The agent signs
+`` `${ts}.quadra-intake/socket` `` with its agent wallet key and passes `{ ts, sig }`
+in the connection `auth`. The server recovers the address, checks it is a
+registered agent, and joins the socket to a room named by that address.
+
+```ts
+import { io } from 'socket.io-client';
+
+const ts = Date.now();
+const { signature } = await keypair.signPersonalMessage(
+    new TextEncoder().encode(`${ts}.quadra-intake/socket`),
+);
+
+const socket = io('http://localhost:5000', { auth: { ts, sig: signature } });
+
+socket.on('ready', ({ agent_wallet }) => console.log('listening as', agent_wallet));
+socket.on('job_paid', (job) => {
+    // { session_id, job_id, escrow_id, cost, paid_at_ms, deadline_ms }
+    startWork(job.job_id); // correlate by session_id/job_id you got from POST /jobs
+});
+socket.on('connect_error', (err) => console.error('auth failed:', err.message));
+```
+
+**Events the agent receives**
+
+| Event      | Payload                                                              | When                                  |
+| ---------- | ------------------------------------------------------------------- | ------------------------------------- |
+| `ready`    | `{ agent_wallet }`                                                  | right after a successful auth          |
+| `job_paid` | `{ session_id, job_id, escrow_id, cost, paid_at_ms, deadline_ms }`  | the agent's job was paid (releasable)  |
+
+`deadline_ms` is when the engine will refund if the job isn't delivered — deliver
+(via `POST /deliver`) before then. Underpaid/orphan payments are **not** notified
+(they are only refunded). Any non-JS agent can use a Socket.IO client (e.g.
+`python-socketio`); only the `auth` payload + event names matter.
+
 ## Run
 
 ```bash

@@ -8,5 +8,7 @@ export { JobPaidWatcher } from './events.js';
 export type { JobPaidEvent, JobPaidHandler } from './events.js';
 export { Payments } from './payments.js';
 export type { PaymentsOptions } from './payments.js';
+export { createNotifier, SOCKET_AUTH_MESSAGE } from './notify.js';
+export type { AgentNotifier, JobPaidNotice, SocketNotifier } from './notify.js';
 export { loadIntakeConfig, createDataLayer, createGateway } from './config.js';
 export type { IntakeConfig } from './config.js';

@@ -8,6 +8,7 @@ export interface PendingJob {
     agent_wallet: string;
     template: JobTemplate;
     lifetime: string;
+    asset: string;
     cost: number;
     created_at: number;
 }
@@ -26,6 +27,8 @@ export interface ActiveJob {
     /** The agreed lifetime (e.g. "5m"); absent for orphan payments. Used to
      * schedule the job's scoring window once the delivery validates. */
     lifetime?: string;
+    /** The asset the job targets; absent for orphan payments. */
+    asset?: string;
 }
 
 const PENDING = (s: string): string => `intake:pending:${s}`;
