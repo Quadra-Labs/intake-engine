@@ -87,6 +87,7 @@ async function testStore(): Promise<void> {
         asset: 'BTC',
         cost: 1000,
         created_at: Date.now(),
+        scoreless: false,
     });
     assert.equal((await store.takePending(sid))?.job_id, jid, 'pending round-trips');
     assert.equal(await store.takePending(sid), null, 'pending removed after take');
@@ -101,6 +102,7 @@ async function testStore(): Promise<void> {
         paid_at_ms: past,
         deadline_ms: past,
         releasable: true,
+        scoreless: false,
         asset: 'BTC',
     });
     assert.ok((await store.dueDeadlines(Date.now())).includes(jid), 'due deadline listed');
@@ -167,7 +169,12 @@ async function testDeliver(): Promise<void> {
         gatewayUrl: `http://localhost:${port}`,
         roleToken: 'tok',
     } satisfies IntakeConfig;
-    const dl = { config: { network: 'testnet' } } as unknown as DataLayer;
+    // jobResultsIndex.get is consulted only for scoreless deliveries; return undefined
+    // (nothing stored) to exercise the "result not stored" gate without a chain release.
+    const dl = {
+        config: { network: 'testnet' },
+        jobResultsIndex: { get: async (_id: string) => undefined },
+    } as unknown as DataLayer;
     const engine = new IntakeEngine(dl, {} as unknown as GatewayClient, config);
     const store = new Store(url, 60_000);
 
@@ -181,6 +188,7 @@ async function testDeliver(): Promise<void> {
         paid_at_ms: Date.now(),
         deadline_ms: Date.now() + 60_000,
         releasable: true,
+        scoreless: false,
         lifetime: '5m',
         asset: 'BTC',
     });
@@ -197,6 +205,26 @@ async function testDeliver(): Promise<void> {
     assert.equal(rejected.reason, 'missing field', 'rejection reason passed through');
     assert.deepEqual(calls, [jid], 'validator consulted exactly once');
     assert.ok(await store.getActive(jid), 'job stays active for the deadline to refund');
+
+    // Scoreless delivery: the validator is NOT consulted; without a stored result
+    // it is gated (and would release once the result is stored — needs the chain).
+    const sjid = `job_scoreless_${Date.now()}`;
+    await store.putActive({
+        job_id: sjid,
+        session_id: 's2',
+        agent_wallet: '0xa',
+        escrow_id: '0xe2',
+        cost: 1000,
+        paid_at_ms: Date.now(),
+        deadline_ms: Date.now() + 60_000,
+        releasable: true,
+        scoreless: true,
+    });
+    const noResult = await engine.deliver(sjid, '0xa');
+    assert.equal(noResult.released, false, 'scoreless without a stored result is not released');
+    assert.equal(noResult.reason, 'result not stored', 'scoreless gate reports missing result');
+    assert.deepEqual(calls, [jid], 'validator not consulted for a scoreless job');
+    await store.removeActive(sjid);
 
     await store.removeActive(jid);
     await store.close();
