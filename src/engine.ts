@@ -156,7 +156,11 @@ export class IntakeEngine {
             return this.#release(jobId, job.escrow_id);
         }
 
-        if (!job.lifetime || !job.asset) {
+        // Scored jobs need a lifetime (the scoring window). An asset is required only for FINANCE
+        // jobs (scored against a Pyth delivery price); PREDICTION jobs (polymarket-*) are asset-less
+        // by design — they resolve from params (market_id / target_ts), the validator skips
+        // start_data, and the scheduler forwards params, so an empty asset is expected and fine.
+        if (!job.lifetime) {
             return { released: false, reason: 'job is not releasable' };
         }
 
