@@ -21,6 +21,7 @@
         "build": "tsup",
         "dev": "tsx watch src/server.ts",
         "start": "tsx src/server.ts",
+        "pm2:start": "pm2 start npm --name quadra-intake -- run start",
         "typecheck": "tsc --noEmit",
         "format": "prettier --write .",
         "format:check": "prettier --check .",
