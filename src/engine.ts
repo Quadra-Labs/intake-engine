@@ -95,13 +95,22 @@ export class IntakeEngine {
     async submit(agentWallet: string, input: JobSubmission): Promise<Session> {
         const template = await this.#dl.jobTemplates.get(input.template_id);
         if (!template) throw new Error(`unknown template ${input.template_id}`);
-        if (!input.lifetime) throw new Error('lifetime is required');
         if (!(input.cost > 0)) throw new Error('cost must be > 0');
-        if (!template.allowed_assets.includes(input.asset)) {
-            throw new Error(`asset ${input.asset} not allowed by template ${template.id}`);
-        }
-        if (parseLifetimeMs(input.lifetime) < template.minimum_lifetime) {
-            throw new Error(`lifetime below the template minimum (${template.minimum_lifetime}ms)`);
+
+        const scoreless = template.scoreless === true;
+        // Scored jobs need an allowed asset + a lifetime >= the template minimum (the
+        // scoring window). Scoreless jobs have neither — they're paid on delivery.
+        if (!scoreless) {
+            if (!input.lifetime) throw new Error('lifetime is required');
+            // An empty allowed_assets means "no asset restriction" (e.g. prediction templates,
+            // whose params are market_id/target_ts, not a Pyth asset). Only constrain when the
+            // template actually lists assets.
+            if (template.allowed_assets.length > 0 && !template.allowed_assets.includes(input.asset)) {
+                throw new Error(`asset ${input.asset} not allowed by template ${template.id}`);
+            }
+            if (parseLifetimeMs(input.lifetime) < template.minimum_lifetime) {
+                throw new Error(`lifetime below the template minimum (${template.minimum_lifetime}ms)`);
+            }
         }
 
         const session: Session = {
@@ -115,16 +124,18 @@ export class IntakeEngine {
             template,
             lifetime: input.lifetime,
             asset: input.asset,
+            scoreless,
             created_at: Date.now(),
         });
         return session;
     }
 
     /**
-     * The agent claims it delivered `job_id` (its sealed result is stored). Asks
-     * the validator engine — which decrypts and has the evaluation engine check
-     * the output — and on a valid verdict releases payment and schedules the
-     * job's scoring at lifetime end. The intake engine never reads the result.
+     * The agent claims it delivered `job_id` (its sealed result is stored).
+     * - Scored job: ask the validator (decrypt + eval check); on a valid verdict
+     *   release payment and schedule scoring at lifetime end.
+     * - Scoreless job: no eval — verify the sealed result is stored, then release;
+     *   no scoring is scheduled. The intake engine never reads the result.
      */
     async deliver(
         jobId: string,
@@ -134,7 +145,18 @@ export class IntakeEngine {
         if (!job || job.agent_wallet !== agentWallet) {
             return { released: false, reason: 'unknown job' };
         }
-        if (!job.releasable || !job.lifetime || !job.asset) {
+        if (!job.releasable) {
+            return { released: false, reason: 'job is not releasable' };
+        }
+
+        if (job.scoreless) {
+            // No validator/eval — just confirm the agent actually stored a result.
+            const blobId = await this.#dl.jobResultsIndex.get(jobId);
+            if (!blobId) return { released: false, reason: 'result not stored' };
+            return this.#release(jobId, job.escrow_id);
+        }
+
+        if (!job.lifetime || !job.asset) {
             return { released: false, reason: 'job is not releasable' };
         }
 
@@ -145,20 +167,8 @@ export class IntakeEngine {
             return { released: false, reason: verdict.reason ?? 'invalid result' };
         }
 
-        if (!(await this.#store.tryLockSettle(jobId))) {
-            return { released: false, reason: 'job is settling' }; // refund in progress
-        }
-        try {
-            await this.#payments.release(job.escrow_id);
-            await this.#store.removeActive(jobId);
-            console.log(`[intake] released payment for ${jobId}`);
-        } catch (error) {
-            const reason = error instanceof Error ? error.message : 'release failed';
-            console.error(`[intake] release ${jobId} failed:`, reason);
-            return { released: false, reason };
-        } finally {
-            await this.#store.unlockSettle(jobId);
-        }
+        const outcome = await this.#release(jobId, job.escrow_id);
+        if (!outcome.released) return outcome;
 
         // Validated: register the job for scoring at lifetime end, carrying the
         // asset + start data so the scheduler can score against the delivery price.
@@ -174,6 +184,25 @@ export class IntakeEngine {
             );
         }
         return { released: true };
+    }
+
+    /** Settle-locked payment release shared by the scored + scoreless deliver paths. */
+    async #release(jobId: string, escrowId: string): Promise<{ released: boolean; reason?: string }> {
+        if (!(await this.#store.tryLockSettle(jobId))) {
+            return { released: false, reason: 'job is settling' }; // refund in progress
+        }
+        try {
+            await this.#payments.release(escrowId);
+            await this.#store.removeActive(jobId);
+            console.log(`[intake] released payment for ${jobId}`);
+            return { released: true };
+        } catch (error) {
+            const reason = error instanceof Error ? error.message : 'release failed';
+            console.error(`[intake] release ${jobId} failed:`, reason);
+            return { released: false, reason };
+        } finally {
+            await this.#store.unlockSettle(jobId);
+        }
     }
 
     /** Ask the validator engine (under the scheduler) whether the result is valid,
@@ -219,6 +248,7 @@ export class IntakeEngine {
             paid_at_ms: event.paid_at_ms,
             deadline_ms,
             releasable,
+            scoreless: pending?.scoreless ?? false,
             // Kept so `deliver` can validate + schedule the scoring window.
             ...(pending ? { lifetime: pending.lifetime, asset: pending.asset } : {}),
         };

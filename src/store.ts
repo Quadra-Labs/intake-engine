@@ -11,6 +11,8 @@ export interface PendingJob {
     asset: string;
     cost: number;
     created_at: number;
+    /** Scoreless jobs are paid on delivery (result stored), never validated/scored. */
+    scoreless: boolean;
 }
 
 /** A paid job awaiting delivery (30-min window). */
@@ -24,10 +26,12 @@ export interface ActiveJob {
     deadline_ms: number;
     /** False for underpaid or orphan payments — never release, only refund. */
     releasable: boolean;
-    /** The agreed lifetime (e.g. "5m"); absent for orphan payments. Used to
-     * schedule the job's scoring window once the delivery validates. */
+    /** Scoreless: paid on delivery (result stored), never validated/scored. */
+    scoreless: boolean;
+    /** The agreed lifetime (e.g. "5m"); absent for orphan/scoreless payments. Used
+     * to schedule the job's scoring window once the delivery validates. */
     lifetime?: string;
-    /** The asset the job targets; absent for orphan payments. */
+    /** The asset the job targets; absent for orphan/scoreless payments. */
     asset?: string;
 }
 
