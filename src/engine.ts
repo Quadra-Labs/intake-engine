@@ -102,7 +102,10 @@ export class IntakeEngine {
         // scoring window). Scoreless jobs have neither — they're paid on delivery.
         if (!scoreless) {
             if (!input.lifetime) throw new Error('lifetime is required');
-            if (!template.allowed_assets.includes(input.asset)) {
+            // An empty allowed_assets means "no asset restriction" (e.g. prediction templates,
+            // whose params are market_id/target_ts, not a Pyth asset). Only constrain when the
+            // template actually lists assets.
+            if (template.allowed_assets.length > 0 && !template.allowed_assets.includes(input.asset)) {
                 throw new Error(`asset ${input.asset} not allowed by template ${template.id}`);
             }
             if (parseLifetimeMs(input.lifetime) < template.minimum_lifetime) {
@@ -153,7 +156,11 @@ export class IntakeEngine {
             return this.#release(jobId, job.escrow_id);
         }
 
-        if (!job.lifetime || !job.asset) {
+        // Scored jobs need a lifetime (the scoring window). An asset is required only for FINANCE
+        // jobs (scored against a Pyth delivery price); PREDICTION jobs (polymarket-*) are asset-less
+        // by design — they resolve from params (market_id / target_ts), the validator skips
+        // start_data, and the scheduler forwards params, so an empty asset is expected and fine.
+        if (!job.lifetime) {
             return { released: false, reason: 'job is not releasable' };
         }
 

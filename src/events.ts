@@ -91,12 +91,16 @@ export class JobPaidWatcher {
     async #ensureCursor(): Promise<EventId | null> {
         const stored = await this.#store.getCursor();
         if (stored) return JSON.parse(stored) as EventId;
-        const latest = await this.#sui.queryEvents({
+        // Seed from the event BEFORE the latest (descending, take the 2nd). The cursor is
+        // EXCLUSIVE, so seeding from the latest event would skip it — which silently drops the
+        // first payment on a fresh package. Taking the 2nd-latest leaves the most recent event
+        // to be processed; with fewer than 2 events, start from the beginning (null).
+        const recent = await this.#sui.queryEvents({
             query: { MoveEventType: this.#eventType },
             order: 'descending',
-            limit: 1,
+            limit: 2,
         });
-        const seed = latest.data[0]?.id ?? null;
+        const seed = recent.data[1]?.id ?? null;
         if (seed) await this.#store.setCursor(JSON.stringify(seed));
         return seed;
     }
