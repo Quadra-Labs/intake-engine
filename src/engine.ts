@@ -141,18 +141,27 @@ export class IntakeEngine {
         jobId: string,
         agentWallet: string,
     ): Promise<{ released: boolean; reason?: string }> {
+        console.log(`[intake] deliver requested for ${jobId} by ${agentWallet}`);
         const job = await this.#store.getActive(jobId);
         if (!job || job.agent_wallet !== agentWallet) {
+            console.warn(
+                `[intake] deliver ${jobId}: unknown job (active=${job ? 'yes' : 'no'}` +
+                    `${job && job.agent_wallet !== agentWallet ? ', agent mismatch' : ''})`,
+            );
             return { released: false, reason: 'unknown job' };
         }
         if (!job.releasable) {
+            console.warn(`[intake] deliver ${jobId}: not releasable (underpaid/orphan payment)`);
             return { released: false, reason: 'job is not releasable' };
         }
 
         if (job.scoreless) {
             // No validator/eval — just confirm the agent actually stored a result.
             const blobId = await this.#dl.jobResultsIndex.get(jobId);
-            if (!blobId) return { released: false, reason: 'result not stored' };
+            if (!blobId) {
+                console.warn(`[intake] deliver ${jobId}: scoreless result not stored on the gateway`);
+                return { released: false, reason: 'result not stored' };
+            }
             return this.#release(jobId, job.escrow_id);
         }
 
@@ -161,15 +170,23 @@ export class IntakeEngine {
         // by design — they resolve from params (market_id / target_ts), the validator skips
         // start_data, and the scheduler forwards params, so an empty asset is expected and fine.
         if (!job.lifetime) {
+            console.warn(`[intake] deliver ${jobId}: scored job missing lifetime`);
             return { released: false, reason: 'job is not releasable' };
         }
+        // FINANCE jobs always carry an asset; PREDICTION jobs are asset-less (resolve from params),
+        // where an empty asset is expected and fine (see note above). Capture once as a string.
+        const lifetime = job.lifetime;
+        const asset = job.asset ?? '';
 
         // The validator decrypts + has the eval engine check the output, and
         // returns the start data (price at delivery) for us to record.
-        const verdict = await this.#askValidator(jobId, job.asset);
+        console.log(`[intake] deliver ${jobId}: asking validator (asset=${asset || '(none)'})`);
+        const verdict = await this.#askValidator(jobId, asset);
         if (!verdict.valid) {
+            console.warn(`[intake] deliver ${jobId}: validator rejected — ${verdict.reason ?? 'invalid result'}`);
             return { released: false, reason: verdict.reason ?? 'invalid result' };
         }
+        console.log(`[intake] deliver ${jobId}: validator accepted; releasing payment`);
 
         const outcome = await this.#release(jobId, job.escrow_id);
         if (!outcome.released) return outcome;
@@ -177,8 +194,8 @@ export class IntakeEngine {
         // Validated: register the job for scoring at lifetime end, carrying the
         // asset + start data so the scheduler can score against the delivery price.
         try {
-            await this.#gateway.scheduleJob(jobId, job.paid_at_ms + parseLifetimeMs(job.lifetime), {
-                asset: job.asset,
+            await this.#gateway.scheduleJob(jobId, job.paid_at_ms + parseLifetimeMs(lifetime), {
+                asset,
                 data: verdict.start_data ?? {},
             });
         } catch (error) {
@@ -215,15 +232,32 @@ export class IntakeEngine {
         jobId: string,
         asset: string,
     ): Promise<{ valid: boolean; reason?: string; start_data?: Record<string, unknown> }> {
-        const res = await fetch(`${this.#config.validatorUrl}/validate`, {
-            method: 'POST',
-            headers: {
-                'content-type': 'application/json',
-                'x-quadra-internal': this.#config.internalToken,
-            },
-            body: JSON.stringify({ job_id: jobId, asset }),
-        });
-        if (!res.ok) throw new Error(`validator responded ${res.status}`);
+        let res: Response;
+        try {
+            res = await fetch(`${this.#config.validatorUrl}/validate`, {
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/json',
+                    'x-quadra-internal': this.#config.internalToken,
+                },
+                body: JSON.stringify({ job_id: jobId, asset }),
+            });
+        } catch (error) {
+            // Transport failure reaching the validator (down / wrong validatorUrl / network).
+            console.error(
+                `[intake] validator unreachable for ${jobId} at ${this.#config.validatorUrl}/validate:`,
+                error instanceof Error ? error.message : error,
+            );
+            throw error;
+        }
+        if (!res.ok) {
+            const body = await res.text().catch(() => '');
+            console.error(
+                `[intake] validator responded ${res.status} for ${jobId}` +
+                    `${body ? `: ${body.slice(0, 300)}` : ''}`,
+            );
+            throw new Error(`validator responded ${res.status}`);
+        }
         return (await res.json()) as {
             valid: boolean;
             reason?: string;

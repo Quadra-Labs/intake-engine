@@ -64,9 +64,13 @@ async function main(): Promise<void> {
         engine
             .deliver(String(body.job_id), agentWallet!)
             .then((outcome) => res.json(outcome))
-            .catch((err) =>
-                res.status(502).json({ error: err instanceof Error ? err.message : 'error' }),
-            );
+            .catch((err) => {
+                console.error(
+                    `[intake] /deliver ${String(body.job_id)} errored:`,
+                    err instanceof Error ? err.message : err,
+                );
+                res.status(502).json({ error: err instanceof Error ? err.message : 'error' });
+            });
     });
 
     app.get('/health', (_req, res) => {
