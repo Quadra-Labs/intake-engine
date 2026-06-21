@@ -112,7 +112,7 @@ plus intake-only vars:
 | `INTAKE_CAP_ID`           | —                        | the `IntakeCap` object id                               |
 | `INTAKE_CONFIG_ID`        | —                        | the shared `IntakeConfig` object id                     |
 | `INTAKE_INTERNAL_TOKEN`   | —                        | shared secret presented to the validator's `/validate`  |
-| `INTAKE_VALIDATOR_URL`    | `http://localhost:4000`  | the validator engine (the scheduler's server)           |
+| `INTAKE_VALIDATOR_URL`    | `http://127.0.0.1:4000`  | the validator (scheduler) — internal only, same host    |
 | `DATA_GATEWAY_URL`        | `http://localhost:8787`  | data gateway intake writes through                      |
 | `ROLE_TOKEN_INTAKE`       | —                        | intake's gateway role token (may write `job_scheduler`) |
 | `REDIS_URL`               | `redis://127.0.0.1:6379` | Redis connection                                        |

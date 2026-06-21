@@ -66,7 +66,9 @@ export function loadIntakeConfig(): IntakeConfig {
         intakeCapId: required('INTAKE_CAP_ID'),
         intakeConfigId: required('INTAKE_CONFIG_ID'),
         internalToken: required('INTAKE_INTERNAL_TOKEN'),
-        validatorUrl: process.env.INTAKE_VALIDATOR_URL ?? 'http://localhost:4000',
+        // Internal only: the scheduler/validator runs on the same host, never public. Explicit IPv4
+        // loopback because intake does not force IPv4-first ("localhost" could resolve to ::1).
+        validatorUrl: process.env.INTAKE_VALIDATOR_URL ?? 'http://127.0.0.1:4000',
         redisUrl: process.env.REDIS_URL ?? 'redis://127.0.0.1:6379',
         port: num('INTAKE_PORT', 5000),
         pendingTtlMs: num('INTAKE_PENDING_TTL_MS', 15 * 60 * 1000),
