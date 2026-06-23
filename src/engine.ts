@@ -8,6 +8,7 @@ import { Store, type ActiveJob } from './store.js';
 import { Payments } from './payments.js';
 import { JobPaidWatcher, type JobPaidEvent } from './events.js';
 import type { AgentNotifier } from './notify.js';
+import { resolveRpcUrl, retryingRpcTransport, withRetry } from './rpcRetry.js';
 
 /** Parse a lifetime like "5m" / "30s" / "2h" / "1d" into milliseconds. */
 export function parseLifetimeMs(lifetime: string): number {
@@ -57,7 +58,7 @@ export class IntakeEngine {
         this.#config = config;
         this.#notifier = notifier;
         this.#sui = new SuiJsonRpcClient({
-            url: getJsonRpcFullnodeUrl(dl.config.network),
+            transport: retryingRpcTransport(resolveRpcUrl(getJsonRpcFullnodeUrl(dl.config.network))),
             network: dl.config.network,
         });
         this.#store = new Store(config.redisUrl, config.pendingTtlMs);
@@ -181,7 +182,20 @@ export class IntakeEngine {
         // The validator decrypts + has the eval engine check the output, and
         // returns the start data (price at delivery) for us to record.
         console.log(`[intake] deliver ${jobId}: asking validator (asset=${asset || '(none)'})`);
-        const verdict = await this.#askValidator(jobId, asset);
+        // The validator answers 502 for transient trouble — most commonly "no result indexed
+        // yet" while the gateway's write-behind flush (≈5s sweep) and the on-chain results index
+        // catch up. Retry across that window so a delivery isn't dropped on a timing race; a
+        // genuine `valid:false` verdict returns without throwing and is never retried.
+        const verdict = await withRetry(() => this.#askValidator(jobId, asset), {
+            maxAttempts: 6,
+            baseDelayMs: 1000,
+            maxDelayMs: 8000,
+            onRetry: (attempt, error) =>
+                console.warn(
+                    `[intake] deliver ${jobId}: validator transient (attempt ${attempt}), retrying — ` +
+                        `${error instanceof Error ? error.message : error}`,
+                ),
+        });
         if (!verdict.valid) {
             console.warn(`[intake] deliver ${jobId}: validator rejected — ${verdict.reason ?? 'invalid result'}`);
             return { released: false, reason: verdict.reason ?? 'invalid result' };
@@ -256,7 +270,11 @@ export class IntakeEngine {
                 `[intake] validator responded ${res.status} for ${jobId}` +
                     `${body ? `: ${body.slice(0, 300)}` : ''}`,
             );
-            throw new Error(`validator responded ${res.status}`);
+            // Carry the HTTP status so the caller's retry can tell a transient 502/503/504
+            // (worth retrying) from a hard failure.
+            const err = new Error(`validator responded ${res.status}`) as Error & { status?: number };
+            err.status = res.status;
+            throw err;
         }
         return (await res.json()) as {
             valid: boolean;
