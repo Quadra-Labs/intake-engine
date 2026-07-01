@@ -7,6 +7,7 @@ import type { IntakeConfig } from './config.js';
 import { Store, type ActiveJob } from './store.js';
 import { Payments } from './payments.js';
 import { JobPaidWatcher, type JobPaidEvent } from './events.js';
+import { wakeEval } from './evalWake.js';
 import type { AgentNotifier } from './notify.js';
 import { resolveRpcUrl, retryingRpcTransport, withRetry } from './rpcRetry.js';
 
@@ -310,6 +311,9 @@ export class IntakeEngine {
         };
         await this.#store.putActive(job);
         if (releasable) {
+            // A real job is now in-flight; wake the (possibly stopped) eval enclave so it's up by
+            // delivery time. Best-effort, opt-in via EVAL_INSTANCE_ID; never blocks payment.
+            wakeEval();
             // Tell the agent its job is paid so it can start working.
             this.#notifier?.jobPaid(event.agent_wallet, {
                 session_id: event.session_id,
